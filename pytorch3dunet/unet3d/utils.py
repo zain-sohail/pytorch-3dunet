@@ -67,20 +67,27 @@ def save_network_output(output_path, output, logger=None):
 
 loggers = {}
 
-
-def get_logger(name, level=logging.INFO):
+def get_logger(name, level=logging.INFO, log_dir=None):
     global loggers
     if loggers.get(name) is not None:
         return loggers[name]
     else:
         logger = logging.getLogger(name)
         logger.setLevel(level)
+        
         # Logging to console
         stream_handler = logging.StreamHandler(sys.stdout)
         formatter = logging.Formatter(
             '%(asctime)s [%(threadName)s] %(levelname)s %(name)s - %(message)s')
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
+        
+        # Logging to file
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(os.path.join(log_dir, f"{name}.log"))
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
         loggers[name] = logger
 
