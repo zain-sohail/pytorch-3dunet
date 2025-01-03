@@ -1,4 +1,7 @@
 import os
+import comet_ml
+from comet_ml.integration.pytorch import watch
+
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -13,19 +16,21 @@ from pytorch3dunet.unet3d.utils import get_logger, get_tensorboard_formatter, cr
     create_lr_scheduler, get_number_of_learnable_parameters
 from . import utils
 
+experiment = comet_ml.start(project='noise2noise-exp5')
 logger = get_logger('UNetTrainer')
 
 
 def create_trainer(config):
     # Create the model
     model = get_model(config['model'])
-
     if torch.cuda.device_count() > 1 and not config['device'] == 'cpu':
         model = nn.DataParallel(model)
         logger.info(f'Using {torch.cuda.device_count()} GPUs for prediction')
     if torch.cuda.is_available() and not config['device'] == 'cpu':
         model = model.cuda()
 
+    watch(model)
+    experiment.log_parameters(config)
     # Log the number of learnable parameters
     logger.info(f'Number of learnable params {get_number_of_learnable_parameters(model)}')
 
@@ -49,10 +54,11 @@ def create_trainer(config):
     # Create trainer
     resume = trainer_config.pop('resume', None)
     pre_trained = trainer_config.pop('pre_trained', None)
+    primary_eval_metric = trainer_config.pop('primary_eval_metric', 'SSIM')
 
     return UNetTrainer(model=model, optimizer=optimizer, lr_scheduler=lr_scheduler, loss_criterion=loss_criterion,
                        eval_criterion=eval_criterion, loaders=loaders, tensorboard_formatter=tensorboard_formatter,
-                       resume=resume, pre_trained=pre_trained, **trainer_config)
+                       resume=resume, pre_trained=pre_trained, primary_eval_metric=primary_eval_metric, **trainer_config)
 
 
 class UNetTrainer:
@@ -84,12 +90,13 @@ class UNetTrainer:
             that can be displayed in tensorboard
         skip_train_validation (bool): if True eval_criterion is not evaluated on the training set (used mostly when
             evaluation is expensive)
+        primary_eval_metric (str): name of the primary evaluation metric for LR scheduler and checkpointing
     """
 
     def __init__(self, model, optimizer, lr_scheduler, loss_criterion, eval_criterion, loaders, checkpoint_dir,
                  max_num_epochs, max_num_iterations, validate_after_iters=200, log_after_iters=100, validate_iters=None,
                  num_iterations=1, num_epoch=0, eval_score_higher_is_better=True, tensorboard_formatter=None,
-                 skip_train_validation=False, resume=None, pre_trained=None, **kwargs):
+                 skip_train_validation=False, resume=None, pre_trained=None, primary_eval_metric='SSIM', **kwargs):
 
         self.model = model
         self.optimizer = optimizer
@@ -104,6 +111,7 @@ class UNetTrainer:
         self.log_after_iters = log_after_iters
         self.validate_iters = validate_iters
         self.eval_score_higher_is_better = eval_score_higher_is_better
+        self.primary_eval_metric = primary_eval_metric
 
         logger.info(model)
         logger.info(f'eval_score_higher_is_better: {eval_score_higher_is_better}')
@@ -164,7 +172,7 @@ class UNetTrainer:
             True if the training should be terminated immediately, False otherwise
         """
         train_losses = utils.RunningAverage()
-        train_eval_scores = utils.RunningAverage()
+        train_eval_scores = {metric.__class__.__name__: utils.RunningAverage() for metric in self.eval_criterion}
 
         # sets the model in training mode
         self.model.train()
@@ -179,6 +187,10 @@ class UNetTrainer:
 
             train_losses.update(loss.item(), self._batch_size(input))
 
+            
+            # Log the current epoch to Comet.ml
+            experiment.log_metric("epoch", self.num_epochs, step=self.num_iterations)
+        
             # compute gradients and update parameters
             self.optimizer.zero_grad()
             loss.backward()
@@ -188,20 +200,20 @@ class UNetTrainer:
                 # set the model in eval mode
                 self.model.eval()
                 # evaluate on validation set
-                eval_score = self.validate()
+                eval_scores = self.validate()
                 # set the model back to training mode
                 self.model.train()
 
                 # adjust learning rate if necessary
                 if isinstance(self.scheduler, ReduceLROnPlateau):
-                    self.scheduler.step(eval_score)
+                    self.scheduler.step(eval_scores[self.primary_eval_metric])  # Assuming the first metric is the primary one
                 elif self.scheduler is not None:
                     self.scheduler.step()
 
                 # log current learning rate in tensorboard
                 self._log_lr()
                 # remember best validation metric
-                is_best = self._is_best_eval_score(eval_score)
+                is_best = self._is_best_eval_score(eval_scores[self.primary_eval_metric])  # Assuming the first metric is the primary one
 
                 # save checkpoint
                 self._save_checkpoint(is_best)
@@ -219,13 +231,17 @@ class UNetTrainer:
                         act_output = final_activation(output)
                     else:
                         act_output = output
-                    eval_score = self.eval_criterion(act_output, target)
-                    train_eval_scores.update(eval_score.item(), self._batch_size(input))
+
+                    for metric in self.eval_criterion:
+                        eval_score = metric(act_output, target)
+                        train_eval_scores[metric.__class__.__name__].update(eval_score.item(), self._batch_size(input))
 
                 # log stats, params and images
+                # Extract the average values from the RunningAverage objects
+                eval_scores = {name: score.avg for name, score in train_eval_scores.items()}
                 logger.info(
-                    f'Training stats. Loss: {train_losses.avg}. Evaluation score: {train_eval_scores.avg}')
-                self._log_stats('train', train_losses.avg, train_eval_scores.avg)
+                    f'Training stats. Loss: {train_losses.avg}. Evaluation scores: {eval_scores}')
+                self._log_stats('train', train_losses.avg, eval_scores)
                 # self._log_params()
                 self._log_images(input, target, output, 'train_')
 
@@ -253,11 +269,12 @@ class UNetTrainer:
 
         return False
 
+
     def validate(self):
         logger.info('Validating...')
 
         val_losses = utils.RunningAverage()
-        val_scores = utils.RunningAverage()
+        val_scores = {metric.__class__.__name__: utils.RunningAverage() for metric in self.eval_criterion}
 
         with torch.no_grad():
             for i, t in enumerate(self.loaders['val']):
@@ -271,16 +288,23 @@ class UNetTrainer:
                 if i % 100 == 0:
                     self._log_images(input, target, output, 'val_')
 
-                eval_score = self.eval_criterion(output, target)
-                val_scores.update(eval_score.item(), self._batch_size(input))
+                for metric in self.eval_criterion:
+                    eval_score = metric(output, target)
+                    val_scores[metric.__class__.__name__].update(eval_score.item(), self._batch_size(input))
 
                 if self.validate_iters is not None and self.validate_iters <= i:
                     # stop validation
                     break
 
-            self._log_stats('val', val_losses.avg, val_scores.avg)
-            logger.info(f'Validation finished. Loss: {val_losses.avg}. Evaluation score: {val_scores.avg}')
-            return val_scores.avg
+            # Extract the average values from the RunningAverage objects
+            eval_scores = {name: score.avg for name, score in val_scores.items()}
+
+            # Log the stats with the actual average values
+            self._log_stats('val', val_losses.avg, eval_scores)
+
+            # Log the validation finished message with the actual average values
+            logger.info(f'Validation finished. Loss: {val_losses.avg}. Evaluation scores: {eval_scores}')
+            return eval_scores
 
     def _split_training_batch(self, t):
         def _move_to_gpu(input):
@@ -354,11 +378,11 @@ class UNetTrainer:
         lr = self.optimizer.param_groups[0]['lr']
         self.writer.add_scalar('learning_rate', lr, self.num_iterations)
 
-    def _log_stats(self, phase, loss_avg, eval_score_avg):
+    def _log_stats(self, phase, loss_avg, eval_scores_avg):
         tag_value = {
             f'{phase}_loss_avg': loss_avg,
-            f'{phase}_eval_score_avg': eval_score_avg
         }
+        tag_value.update({f'{phase}_{name}_avg': score for name, score in eval_scores_avg.items()})
 
         for tag, value in tag_value.items():
             self.writer.add_scalar(tag, value, self.num_iterations)
