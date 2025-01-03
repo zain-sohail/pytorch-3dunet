@@ -205,8 +205,14 @@ def get_train_loaders(config):
         "Train and validation 'file_paths' overlap. One cannot use validation data for training!"
 
     train_datasets = dataset_class.create_datasets(loaders_config, phase='train')
-
     val_datasets = dataset_class.create_datasets(loaders_config, phase='val')
+
+    # Calculate total number of patches
+    total_train_patches = sum(len(dataset) for dataset in train_datasets)
+    total_val_patches = sum(len(dataset) for dataset in val_datasets)
+
+    logger.info(f'Total number of training patches: {total_train_patches}')
+    logger.info(f'Total number of validation patches: {total_val_patches}')
 
     num_workers = loaders_config.get('num_workers', 1)
     logger.info(f'Number of workers for train/val dataloader: {num_workers}')
