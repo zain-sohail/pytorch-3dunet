@@ -53,6 +53,9 @@ def load_config():
 
     if torch.cuda.is_available():
         config['device'] = 'cuda'
+    elif torch.backends.mps.is_available():
+        config['device'] = 'mps'
+        logger.info('MPS available, using MPS')
     else:
         logger.warning('CUDA not available, using CPU')
         config['device'] = 'cpu'

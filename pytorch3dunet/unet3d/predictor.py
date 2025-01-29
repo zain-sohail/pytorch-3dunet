@@ -201,6 +201,8 @@ class StandardPredictor(_AbstractPredictor):
                     # send batch to gpu
                     if torch.cuda.is_available():
                         input = input.pin_memory().cuda(non_blocking=True)
+                    elif torch.backends.mps.is_available():
+                        input = input.to(torch.device("mps"))
 
                     if is_model_2d(self.model):
                         # remove the singleton z-dimension from the input
@@ -337,6 +339,8 @@ class DSB2018Predictor(_AbstractPredictor):
                 # send batch to gpu
                 if torch.cuda.is_available():
                     img = img.cuda(non_blocking=True)
+                elif torch.backends.mps.is_available():
+                    img = img.to(torch.device("mps"))
                 # forward pass
                 pred = self.model(img)
 
