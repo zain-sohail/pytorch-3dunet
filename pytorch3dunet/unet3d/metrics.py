@@ -3,12 +3,14 @@ import importlib
 import numpy as np
 import torch
 from skimage import measure
-from skimage.metrics import adapted_rand_error, peak_signal_noise_ratio, mean_squared_error
+# TODO: Better to use PIQA later
+from skimage.metrics import adapted_rand_error, peak_signal_noise_ratio, mean_squared_error, structural_similarity
 
 from pytorch3dunet.unet3d.losses import compute_per_channel_dice
 from pytorch3dunet.unet3d.seg_metrics import AveragePrecision, Accuracy
 from pytorch3dunet.unet3d.utils import get_logger, convert_to_numpy
 
+from pytorch_msssim import ms_ssim
 logger = get_logger('EvalMetric')
 
 
@@ -410,12 +412,47 @@ class MSE:
         input, target = convert_to_numpy(input, target)
         return mean_squared_error(input, target)
 
+class SSIM:
+    """
+    Computes Structural Similarity Index. Use e.g. as an eval metric for denoising task
+    """
+
+    def __init__(self, **kwargs):
+        pass
+
+    def __call__(self, input, target):
+        input, target = convert_to_numpy(input, target)
+        input = np.squeeze(input, axis=1)  # Remove channel dimension
+        target = np.squeeze(target, axis=1)  # Remove channel dimension
+        
+        # Compute SSIM for each 3D volume in the batch
+        ssim_scores = [
+            structural_similarity(input[i], target[i], data_range=1.0)
+            for i in range(input.shape[0])
+        ]
+        
+        # Average SSIM score over the batch
+        ssim_score = np.mean(ssim_scores)
+        
+        return ssim_score
+
+class MSSSIM:
+    """
+    Computes MultiScale Structural Similarity Index. Use e.g. as an eval metric for denoising task
+    """
+
+    def __init__(self, **kwargs):
+        pass
+
+    def __call__(self, input, target):        
+        return ms_ssim(input, target, data_range=1.0)
+
 
 def get_evaluation_metric(config):
     """
-    Returns the evaluation metric function based on provided configuration
+    Returns a list of evaluation metric functions based on provided configuration
     :param config: (dict) a top level configuration object containing the 'eval_metric' key
-    :return: an instance of the evaluation metric
+    :return: a list of instances of the evaluation metrics
     """
 
     def _metric_class(class_name):
@@ -424,6 +461,9 @@ def get_evaluation_metric(config):
         return clazz
 
     assert 'eval_metric' in config, 'Could not find evaluation metric configuration'
-    metric_config = config['eval_metric']
-    metric_class = _metric_class(metric_config['name'])
-    return metric_class(**metric_config)
+    metric_configs = config['eval_metric']
+    metrics = []
+    for metric_config in metric_configs:
+        metric_class = _metric_class(metric_config['name'])
+        metrics.append(metric_class(**metric_config))
+    return metrics
