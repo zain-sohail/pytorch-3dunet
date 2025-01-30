@@ -66,6 +66,20 @@ def create_trainer(config: dict) -> 'UNetTrainer':
                        eval_criterion=eval_criterion, loaders=loaders, tensorboard_formatter=tensorboard_formatter,
                        resume=resume, pre_trained=pre_trained,primary_eval_metric=primary_eval_metric, **trainer_config)
 
+def _split_and_move_to_gpu(t):
+    def _move_to_gpu(input):
+        if isinstance(input, (tuple, list)):
+            return tuple([_move_to_gpu(x) for x in input])
+        else:
+            if torch.cuda.is_available():
+                input = input.cuda(non_blocking=True)
+            elif torch.backends.mps.is_available():
+                input = input.to(torch.device("mps"))
+            return input
+
+    input, target = _move_to_gpu(t)
+    return input, target
+
 
 class UNetTrainer:
     """UNet trainer.
